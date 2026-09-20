@@ -136,7 +136,7 @@ jobs:
           path: |
             ish-arm64/build-arm64-release
             build/root.tar.gz
-          key: dsh-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-rootfs.sh', 'rootfs/**', 'ish-arm64/**') }}
+          key: dsh-build-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-rootfs.sh', '.github/scripts/check-rootfs.py', 'rootfs/**', 'ish-arm64/**') }}
 
       - name: Build the iSH-ARM64 CLI
         run: |
@@ -175,17 +175,27 @@ jobs:
           ls -lh build/root.tar.gz
           shasum -a 256 build/root.tar.gz | tee build/root.tar.gz.sha256
 
+      - name: Verify the guest image
+        id: verify_rootfs
+        # The emulator's exit status does not carry the guest shell's, so a guest
+        # that never got its packages still exports a plausible root.tar.gz.
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check-rootfs.py build/root.tar.gz rootfs/staging/package.json | tee build/rootfs-verify.txt
+
       - name: Save the emulator + guest image cache
-        # Also worth keeping after a failure: the steps above check what really
+        # Worth keeping after a failure: the steps above check what really
         # exists, so a restored meson tree still gets `ninja`ed and a missing
-        # guest image still gets built.
-        if: always() && steps.cache.outputs.cache-hit != 'true' && github.event.inputs.use_cache != 'false'
+        # guest image still gets built. A guest image that failed verification
+        # is never cached, though — that is how the first green run shipped an
+        # image with no node in it.
+        if: always() && steps.cache.outputs.cache-hit != 'true' && github.event.inputs.use_cache != 'false' && steps.verify_rootfs.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: |
             ish-arm64/build-arm64-release
             build/root.tar.gz
-          key: dsh-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-rootfs.sh', 'rootfs/**', 'ish-arm64/**') }}
+          key: dsh-build-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-rootfs.sh', '.github/scripts/check-rootfs.py', 'rootfs/**', 'ish-arm64/**') }}
 
       - name: Regenerate DSH.xcodeproj (optional)
         if: ${{ github.event.inputs.regenerate_project == 'true' }}
