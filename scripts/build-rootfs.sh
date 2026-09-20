@@ -35,6 +35,11 @@ ish() {
     "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh 2>&1 | filter
 }
 
+ish_run() {
+    # ish_run <command>; runs one guest command in the fakefs
+    "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh -c "$1" 2>&1 | filter
+}
+
 [ -x "$ISH_BUILD/ish" ] || die "iSH CLI not built. Run: (cd $ISH_SRC && meson setup build-arm64-release -Dguest_arch=arm64 --buildtype=release && ninja -C build-arm64-release)"
 [ -x "$ISH_BUILD/tools/fakefsify" ] || die "fakefsify not built in $ISH_BUILD/tools"
 command -v npm >/dev/null || die "npm is required on the host"
@@ -57,10 +62,13 @@ cp "$ROOT/rootfs/staging/package.json" stage/
   || npm install "@deepseek-ai/dsh@${DSH_VERSION}" --os=linux --cpu=arm64 --libc=musl --ignore-scripts --no-audit --no-fund )
 cp stage/package-lock.json "$ROOT/rootfs/staging/package-lock.json"
 
-# The guest resolves names with the host's sockets, so give it the host's own
-# nameservers first — but keep the public ones behind them, because a build
-# machine's resolver is not always reachable from inside the emulator (and a
-# hardcoded public resolver is not always reachable from the build machine).
+# The guest resolves names with the host's sockets, but has no resolver of its
+# own: the Alpine minirootfs ships no /etc/resolv.conf. Give it the host's
+# nameservers, with the public ones behind them, because a build machine may not
+# be able to reach the public resolvers and the emulator may not be able to
+# reach the build machine's. It has to be written from *inside* the guest: a
+# file dropped into the image directory on the host is invisible to fakefs,
+# which indexes every inode in meta.db.
 host_ns="$(sed -n 's/^nameserver[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' /etc/resolv.conf 2>/dev/null | head -3 | tr '\n' ' ')"
 guest_ns=""
 for ns in $host_ns 8.8.8.8 1.1.1.1; do
@@ -68,9 +76,8 @@ for ns in $host_ns 8.8.8.8 1.1.1.1; do
     guest_ns="$guest_ns $ns"
 done
 log "Guest DNS:$guest_ns"
-mkdir -p "$WORK/fakefs/etc"
-: > "$WORK/fakefs/etc/resolv.conf"
-for ns in $guest_ns; do printf 'nameserver %s\n' "$ns" >> "$WORK/fakefs/etc/resolv.conf"; done
+ish_run "printf 'nameserver %s\n'$guest_ns > /etc/resolv.conf"
+ish_run "cat /etc/resolv.conf"
 
 log "Guest phase 1: packages"
 # The emulator's exit status does not carry the guest shell's, so every phase is
@@ -88,14 +95,14 @@ echo "--- apk add"
 apk add --no-progress nodejs npm nodejs-dev python3 make g++ bash git curl openssh-client ca-certificates
 node -v; npm -v
 EOF
-    if [ -x "$WORK/fakefs/usr/bin/node" ] && [ -x "$WORK/fakefs/usr/bin/npm" ]; then
+    if [ -x "$WORK/fakefs/data/usr/bin/node" ] && [ -x "$WORK/fakefs/data/usr/bin/npm" ]; then
         break
     fi
     log "attempt $attempt left no node/npm in the image — retrying in 15s"
     sleep 15
 done
-[ -x "$WORK/fakefs/usr/bin/node" ] || die "the guest never got nodejs/npm: the emulator has no usable network or DNS from this host"
-[ -x "$WORK/fakefs/usr/bin/npm" ] || die "the guest got nodejs but no npm"
+[ -x "$WORK/fakefs/data/usr/bin/node" ] || die "the guest never got nodejs/npm: the emulator has no usable network or DNS from this host"
+[ -x "$WORK/fakefs/data/usr/bin/npm" ] || die "the guest got nodejs but no npm"
 
 log "Guest phase 2: install node_modules + polyfills + overlay"
 # Assemble one payload tree rooted at / (staged node_modules, the iSH
@@ -121,9 +128,9 @@ find payload -name '._*' -delete
 # when this payload is unpacked by the Linux guest.
 COPYFILE_DISABLE=1 tar czf payload.tgz -C payload .
 "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh -c 'cd / && tar xzf -' < payload.tgz 2>&1 | filter
-[ -f "$WORK/fakefs/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json" ] || die "the dsh node_modules payload never reached the guest"
-[ -f "$WORK/fakefs/lib/fetch-polyfill.js" ] || die "the fetch() polyfill never reached the guest"
-[ -f "$WORK/fakefs/usr/local/share/dsh/cordis.patch.yml" ] || die "the dsh profile patch never reached the guest"
+[ -f "$WORK/fakefs/data/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json" ] || die "the dsh node_modules payload never reached the guest"
+[ -f "$WORK/fakefs/data/lib/fetch-polyfill.js" ] || die "the fetch() polyfill never reached the guest"
+[ -f "$WORK/fakefs/data/usr/local/share/dsh/cordis.patch.yml" ] || die "the dsh profile patch never reached the guest"
 
 log "Guest phase 3: node-pty rebuild for musl, profile, cleanup"
 ish <<EOF
@@ -149,10 +156,10 @@ rm -rf /root/.npm /root/.cache /var/cache/apk/* /tmp/* /usr/local/lib/node_modul
 echo "guest node: \$(node -v), dsh: \$(dsh --version)"
 du -sh /usr/local/lib/node_modules /usr/lib/node_modules 2>/dev/null
 EOF
-[ -f "$WORK/fakefs/usr/local/lib/node_modules/node-pty/build/Release/pty.node" ] || die "node-pty was not rebuilt for musl — the terminal would not work"
-[ -f "$WORK/fakefs/root/.dsh/profiles/web/cordis.patch.yml" ] || die "the web profile was never scaffolded in the guest"
-[ -d "$WORK/fakefs/root/workspace" ] || die "the guest workspace was never created"
-[ -x "$WORK/fakefs/usr/local/bin/dsh-serve" ] || die "dsh-serve is missing from the guest image"
+[ -f "$WORK/fakefs/data/usr/local/lib/node_modules/node-pty/build/Release/pty.node" ] || die "node-pty was not rebuilt for musl — the terminal would not work"
+[ -f "$WORK/fakefs/data/root/.dsh/profiles/web/cordis.patch.yml" ] || die "the web profile was never scaffolded in the guest"
+[ -d "$WORK/fakefs/data/root/workspace" ] || die "the guest workspace was never created"
+[ -x "$WORK/fakefs/data/usr/local/bin/dsh-serve" ] || die "dsh-serve is missing from the guest image"
 
 log "Export root.tar.gz"
 rm -f "$OUT"
