@@ -23,7 +23,11 @@ void do_uname(struct uname *uts) {
 
     memset(uts, 0, sizeof(struct uname));
     strcpy(uts->system, "Linux");
-    strcpy(uts->hostname, hostname);
+    // The guest's field is 65 bytes; the host's nodename is not. A machine with
+    // a long hostname (build farms, managed Macs) overflows it, and an
+    // optimized build with _FORTIFY_SOURCE turns that into __chk_fail_overflow
+    // the moment any guest process calls uname(2).
+    snprintf(uts->hostname, sizeof(uts->hostname), "%s", hostname);
     strcpy(uts->release, "4.20.69-ish");
     snprintf(uts->version, sizeof(uts->version), "%s %s %s", uname_version, __DATE__, __TIME__);
 #if defined(GUEST_ARM64)

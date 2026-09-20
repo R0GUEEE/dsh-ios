@@ -131,7 +131,7 @@ jobs:
       - name: Restore the emulator + guest image cache
         if: ${{ github.event.inputs.use_cache != 'false' }}
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ish-arm64/build-arm64-release
@@ -174,6 +174,18 @@ jobs:
           fi
           ls -lh build/root.tar.gz
           shasum -a 256 build/root.tar.gz | tee build/root.tar.gz.sha256
+
+      - name: Save the emulator + guest image cache
+        # Also worth keeping after a failure: the steps above check what really
+        # exists, so a restored meson tree still gets `ninja`ed and a missing
+        # guest image still gets built.
+        if: always() && steps.cache.outputs.cache-hit != 'true' && github.event.inputs.use_cache != 'false'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ish-arm64/build-arm64-release
+            build/root.tar.gz
+          key: dsh-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-rootfs.sh', 'rootfs/**', 'ish-arm64/**') }}
 
       - name: Regenerate DSH.xcodeproj (optional)
         if: ${{ github.event.inputs.regenerate_project == 'true' }}
