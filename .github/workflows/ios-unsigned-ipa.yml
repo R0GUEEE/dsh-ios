@@ -280,12 +280,16 @@ jobs:
           marketing="${{ steps.version.outputs.marketing }}"
           build="${{ steps.version.outputs.build }}"
           rootfs_sha="$(cut -d' ' -f1 < build/root.tar.gz.sha256)"
+          ipa_sha="$(shasum -a 256 build/DSH-unsigned.ipa | cut -d' ' -f1)"
           assets=(build/DSH-unsigned.ipa)
           [ -f build/DSH-dSYMs.zip ] && assets+=(build/DSH-dSYMs.zip)
-          notes="$(printf 'Unsigned DSH %s (%s) built from %s by workflow run %s.\n\n| file | what |\n|---|---|\n| `DSH-unsigned.ipa` | the app, unsigned (re-sign with your own profile before installing) |\n| `DSH-dSYMs.zip` | debug symbols for the archive |\n\nGuest image: Alpine + Node 22 + dsh, sha256 `%s`.\n' \
-            "$marketing" "$build" "$(git rev-parse --short HEAD)" "${{ github.run_id }}" "$rootfs_sha")"
+          notes="$(printf 'Unsigned DSH %s (%s) built from %s by workflow run %s.\n\n| file | what | sha256 |\n|---|---|---|\n| `DSH-unsigned.ipa` | the app, unsigned — re-sign with your own profile before installing | `%s` |\n| `DSH-dSYMs.zip` | debug symbols for the archive | |\n\nGuest image inside the app: Alpine 3.21 + Node 22 + dsh, sha256 `%s`.\n' \
+            "$marketing" "$build" "$(git rev-parse --short HEAD)" "${{ github.run_id }}" "$ipa_sha" "$rootfs_sha")"
           if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-running for the same version must refresh the notes too, or the
+            # release keeps describing whichever run created it.
             gh release upload "$tag" --clobber "${assets[@]}"
+            gh release edit "$tag" --title "DSH $marketing ($build) — unsigned IPA" --notes "$notes"
           else
             gh release create "$tag" \
               --target "$GITHUB_SHA" \
