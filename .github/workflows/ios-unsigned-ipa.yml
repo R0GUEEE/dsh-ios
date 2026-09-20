@@ -1,0 +1,303 @@
+name: iOS unsigned IPA
+
+# Builds DSH.ipa (unsigned) on a GitHub macOS runner, with no Apple signing
+# credentials anywhere: the iSH-ARM64 CLI, then the Alpine+Node+dsh guest image,
+# then the Xcode archive, then Payload/ zipped up.
+#
+#   make emulator   -> ish-arm64/build-arm64-release/{ish,tools/fakefsify}
+#   make rootfs     -> build/root.tar.gz (the guest image the app bundles)
+#   xcodebuild archive CODE_SIGNING_ALLOWED=NO -> build/DSH.xcarchive
+#
+# Two runner-image notes:
+#   * ld.lld (brew lld) is mandatory. The guest VDSO is a real aarch64 ELF; with
+#     no cross-linker meson silently builds an empty stub instead, which compiles
+#     and links but cannot boot a single guest process. The workflow asserts the
+#     VDSO is real, so this cannot slip through.
+#   * the guest inherits the host's sockets, so the nameservers the runner itself
+#     uses are copied into the guest image (see scripts/build-rootfs.sh) rather
+#     than hardcoding 8.8.8.8, which some build networks cannot reach.
+#
+# The IPA is unsigned: re-sign it with your own profile (AltStore, SideStore,
+# Xcode, …) to install. The app asks for com.apple.developer.healthkit and
+# com.apple.developer.private-cloud-compute, which a wildcard profile cannot
+# carry — a re-signing tool will simply drop them, and everything except Apple
+# Health works without them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: Publish the IPA as a GitHub release
+        type: boolean
+        default: true
+      release_tag:
+        description: Release tag (blank = auto from the app version)
+        type: string
+        default: ''
+      use_cache:
+        description: Reuse the cached emulator build and guest image
+        type: boolean
+        default: true
+      regenerate_project:
+        description: Regenerate DSH.xcodeproj before building (needs the xcodeproj gem)
+        type: boolean
+        default: false
+      xcode_version:
+        description: Xcode to select, e.g. 26.6 (blank = newest installed)
+        type: string
+        default: ''
+  push:
+    branches: [main]
+    paths: ['.github/workflows/ios-unsigned-ipa.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: DSH.ipa (unsigned)
+    runs-on: macos-26
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      # Empty on purpose: the emulator xcconfig takes the team from the command
+      # line, and there is nothing to sign with here.
+      DSH_DEVELOPMENT_TEAM: ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show the runner and the installed Xcodes
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          df -h /
+          echo '--- /Applications'
+          ls -d /Applications/Xcode*.app || true
+          xcodebuild -version || true
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          want="${{ github.event.inputs.xcode_version }}"
+          if [ -n "$want" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${want}.app"
+          else
+            newest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+            sudo xcode-select -s "$newest"
+          fi
+          echo "using $(xcode-select -p)"
+          xcodebuild -version
+          echo "iOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          for pkg in meson ninja llvm lld libarchive pkgconf; do
+            brew list --versions "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+          brew list --versions meson ninja llvm lld libarchive pkgconf
+          lld_bin="$(brew --prefix lld)/bin"
+          llvm_bin="$(brew --prefix llvm)/bin"
+          echo "$lld_bin" >> "$GITHUB_PATH"
+          echo "ld.lld : $lld_bin/ld.lld"
+          echo "llvm   : $llvm_bin/clang (the guest VDSO uses this one)"
+          echo "clang  : $(command -v clang)"
+          clang --version | head -3
+          test -x "$lld_bin/ld.lld"
+          test -x "$llvm_bin/clang"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Tool versions
+        run: |
+          set -euo pipefail
+          node -v
+          npm -v
+          meson --version
+          ninja --version
+
+      - name: Restore the emulator + guest image cache
+        if: ${{ github.event.inputs.use_cache != 'false' }}
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ish-arm64/build-arm64-release
+            build/root.tar.gz
+          key: dsh-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-rootfs.sh', 'rootfs/**', 'ish-arm64/**') }}
+
+      - name: Build the iSH-ARM64 CLI
+        run: |
+          set -euo pipefail
+          if [ -x ish-arm64/build-arm64-release/ish ] && [ -x ish-arm64/build-arm64-release/tools/fakefsify ]; then
+            echo 'reusing the cached meson build'
+            ninja -C ish-arm64/build-arm64-release
+            exit 0
+          fi
+          command -v ld.lld
+          make emulator
+
+      - name: Assert the guest VDSO is real
+        run: |
+          set -euo pipefail
+          vdso=ish-arm64/build-arm64-release/vdso/arm64/libvdso.so.elf
+          ls -l "$vdso"
+          test -s "$vdso" || {
+            echo "::error::$vdso is the empty stub — no aarch64 cross-linker was found, guests cannot run"
+            exit 1
+          }
+          file "$vdso"
+          file "$vdso" | grep -qi 'aarch64\|ARM' || {
+            echo "::error::$vdso is not an aarch64 ELF"
+            exit 1
+          }
+
+      - name: Build the guest image (Alpine + Node 22 + dsh)
+        run: |
+          set -euo pipefail
+          if [ -s build/root.tar.gz ]; then
+            echo 'reusing the cached guest image'
+          else
+            make rootfs
+          fi
+          ls -lh build/root.tar.gz
+          shasum -a 256 build/root.tar.gz | tee build/root.tar.gz.sha256
+
+      - name: Regenerate DSH.xcodeproj (optional)
+        if: ${{ github.event.inputs.regenerate_project == 'true' }}
+        run: |
+          set -euo pipefail
+          cp -R DSH.xcodeproj DSH.xcodeproj.committed
+          (sudo gem install --no-document xcodeproj || gem install --no-document xcodeproj) || true
+          ruby -e "require 'xcodeproj'; puts %(xcodeproj #{Xcodeproj::VERSION})"
+          if ruby scripts/gen-xcode-project.rb; then
+            rm -rf DSH.xcodeproj.committed
+          else
+            echo '::error::gen-xcode-project.rb failed — falling back to the committed project'
+            rm -rf DSH.xcodeproj
+            mv DSH.xcodeproj.committed DSH.xcodeproj
+            exit 1
+          fi
+
+      - name: Inspect the project
+        run: |
+          set -euo pipefail
+          xcodebuild -project DSH.xcodeproj -list
+          python3 .github/scripts/check-project.py DSH.xcodeproj/project.pbxproj
+
+      - name: Archive the app (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/DSH.xcarchive \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DSH_DEVELOPMENT_TEAM="" \
+            archive 2>&1 | tee build/archive.log
+          test -d build/DSH.xcarchive/Products/Applications/DSH.app
+          ls -lh build/DSH.xcarchive/Products/Applications/
+
+      - name: Package the unsigned IPA
+        run: |
+          set -euo pipefail
+          app=build/DSH.xcarchive/Products/Applications/DSH.app
+          rm -rf build/Payload build/DSH-unsigned.ipa build/DSH-dSYMs.zip
+          mkdir -p build/Payload
+          cp -R "$app" build/Payload/
+          ( cd build && zip -qry -X DSH-unsigned.ipa Payload )
+          ls -lh build/DSH-unsigned.ipa
+          if [ -d build/DSH.xcarchive/dSYMs ]; then
+            ( cd build/DSH.xcarchive && zip -qry -X ../DSH-dSYMs.zip dSYMs )
+            ls -lh build/DSH-dSYMs.zip
+          fi
+
+      - name: Verify the IPA
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify-ipa.py build/DSH-unsigned.ipa | tee build/ipa-verify.txt
+
+      - name: Read the app version
+        id: version
+        run: |
+          set -euo pipefail
+          marketing="$(sed -n 's/^MARKETING_VERSION *= *//p' app/AppDSH.xcconfig | tr -d '[:space:]')"
+          build="$(sed -n 's/^CURRENT_PROJECT_VERSION *= *//p' app/AppDSH.xcconfig | tr -d '[:space:]')"
+          test -n "$marketing"
+          test -n "$build"
+          echo "marketing=$marketing" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "tag=dsh-${marketing}-${build}" >> "$GITHUB_OUTPUT"
+          echo "DSH $marketing ($build)"
+
+      - name: Publish the release
+        if: ${{ github.event.inputs.create_release != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.release_tag }}"
+          [ -n "$tag" ] || tag="${{ steps.version.outputs.tag }}"
+          marketing="${{ steps.version.outputs.marketing }}"
+          build="${{ steps.version.outputs.build }}"
+          rootfs_sha="$(cut -d' ' -f1 < build/root.tar.gz.sha256)"
+          assets=(build/DSH-unsigned.ipa)
+          [ -f build/DSH-dSYMs.zip ] && assets+=(build/DSH-dSYMs.zip)
+          notes="$(printf 'Unsigned DSH %s (%s) built from %s by workflow run %s.\n\n| file | what |\n|---|---|\n| `DSH-unsigned.ipa` | the app, unsigned (re-sign with your own profile before installing) |\n| `DSH-dSYMs.zip` | debug symbols for the archive |\n\nGuest image: Alpine + Node 22 + dsh, sha256 `%s`.\n' \
+            "$marketing" "$build" "$(git rev-parse --short HEAD)" "${{ github.run_id }}" "$rootfs_sha")"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber "${assets[@]}"
+          else
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "DSH $marketing ($build) — unsigned IPA" \
+              --notes "$notes" \
+              "${assets[@]}"
+          fi
+
+      - name: Upload the workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-unsigned-ipa
+          path: |
+            build/DSH-unsigned.ipa
+            build/DSH-dSYMs.zip
+            build/ipa-verify.txt
+            build/archive.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### DSH unsigned IPA'
+            echo
+            if [ -f build/ipa-verify.txt ]; then
+              cat build/ipa-verify.txt
+            else
+              echo '_no IPA was produced — see the logs above_'
+            fi
+            echo
+            echo '```'
+            tail -n 40 build/archive.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

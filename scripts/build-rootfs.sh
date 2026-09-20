@@ -57,11 +57,19 @@ cp "$ROOT/rootfs/staging/package.json" stage/
   || npm install "@deepseek-ai/dsh@${DSH_VERSION}" --os=linux --cpu=arm64 --libc=musl --ignore-scripts --no-audit --no-fund )
 cp stage/package-lock.json "$ROOT/rootfs/staging/package-lock.json"
 
+# The guest resolves names with the host's sockets, so give it the host's own
+# nameservers. A hardcoded public resolver is unreachable from some build
+# networks (CI), where apk then fails with "DNS: transient error".
+guest_ns="$(sed -n 's/^nameserver[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' /etc/resolv.conf 2>/dev/null | head -3 | tr '\n' ' ')"
+[ -n "${guest_ns// /}" ] || guest_ns="8.8.8.8 1.1.1.1"
+log "Guest DNS: $guest_ns"
+mkdir -p "$WORK/fakefs/etc"
+: > "$WORK/fakefs/etc/resolv.conf"
+for ns in $guest_ns; do printf 'nameserver %s\n' "$ns" >> "$WORK/fakefs/etc/resolv.conf"; done
+
 log "Guest phase 1: packages"
 ish <<'EOF'
 set -e
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 apk update >/dev/null
 apk add --no-progress nodejs npm nodejs-dev python3 make g++ bash git curl openssh-client ca-certificates 2>&1 | tail -1
 node -v; npm -v
