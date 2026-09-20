@@ -40,6 +40,19 @@ ish_run() {
     "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh -c "$1" 2>&1 | filter
 }
 
+guest_out() {
+    # guest_out <command>; the command's stdout, guest's stderr discarded.
+    # The emulator's exit status does not carry the guest shell's, so every
+    # check below reads what the guest itself printed instead of trusting a
+    # status or guessing at fakefs's on-host layout.
+    "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh -c "$1" 2>/dev/null | filter
+}
+
+guest_has() {
+    # guest_has <path>; true when the guest can see that path
+    [ "$(guest_out "test -e $1 && echo yes")" = yes ]
+}
+
 [ -x "$ISH_BUILD/ish" ] || die "iSH CLI not built. Run: (cd $ISH_SRC && meson setup build-arm64-release -Dguest_arch=arm64 --buildtype=release && ninja -C build-arm64-release)"
 [ -x "$ISH_BUILD/tools/fakefsify" ] || die "fakefsify not built in $ISH_BUILD/tools"
 command -v npm >/dev/null || die "npm is required on the host"
@@ -95,14 +108,18 @@ echo "--- apk add"
 apk add --no-progress nodejs npm nodejs-dev python3 make g++ bash git curl openssh-client ca-certificates
 node -v; npm -v
 EOF
-    if [ -x "$WORK/fakefs/data/usr/bin/node" ] && [ -x "$WORK/fakefs/data/usr/bin/npm" ]; then
-        break
-    fi
-    log "attempt $attempt left no node/npm in the image — retrying in 15s"
+    node_version="$(guest_out 'node -v 2>/dev/null')"
+    case "$node_version" in
+        v2*) break ;;
+    esac
+    log "attempt $attempt left no node in the image — retrying in 15s"
     sleep 15
 done
-[ -x "$WORK/fakefs/data/usr/bin/node" ] || die "the guest never got nodejs/npm: the emulator has no usable network or DNS from this host"
-[ -x "$WORK/fakefs/data/usr/bin/npm" ] || die "the guest got nodejs but no npm"
+case "$node_version" in
+    v2*) log "guest node: $node_version" ;;
+    *) die "the guest never got nodejs/npm: the emulator has no usable network or DNS from this host" ;;
+esac
+guest_has /usr/bin/npm || die "the guest got nodejs but no npm"
 
 log "Guest phase 2: install node_modules + polyfills + overlay"
 # Assemble one payload tree rooted at / (staged node_modules, the iSH
@@ -128,9 +145,9 @@ find payload -name '._*' -delete
 # when this payload is unpacked by the Linux guest.
 COPYFILE_DISABLE=1 tar czf payload.tgz -C payload .
 "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh -c 'cd / && tar xzf -' < payload.tgz 2>&1 | filter
-[ -f "$WORK/fakefs/data/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json" ] || die "the dsh node_modules payload never reached the guest"
-[ -f "$WORK/fakefs/data/lib/fetch-polyfill.js" ] || die "the fetch() polyfill never reached the guest"
-[ -f "$WORK/fakefs/data/usr/local/share/dsh/cordis.patch.yml" ] || die "the dsh profile patch never reached the guest"
+guest_has /usr/local/lib/node_modules/@deepseek-ai/dsh/package.json || die "the dsh node_modules payload never reached the guest"
+guest_has /lib/fetch-polyfill.js || die "the fetch() polyfill never reached the guest"
+guest_has /usr/local/share/dsh/cordis.patch.yml || die "the dsh profile patch never reached the guest"
 
 log "Guest phase 3: node-pty rebuild for musl, profile, cleanup"
 ish <<EOF
@@ -156,10 +173,10 @@ rm -rf /root/.npm /root/.cache /var/cache/apk/* /tmp/* /usr/local/lib/node_modul
 echo "guest node: \$(node -v), dsh: \$(dsh --version)"
 du -sh /usr/local/lib/node_modules /usr/lib/node_modules 2>/dev/null
 EOF
-[ -f "$WORK/fakefs/data/usr/local/lib/node_modules/node-pty/build/Release/pty.node" ] || die "node-pty was not rebuilt for musl — the terminal would not work"
-[ -f "$WORK/fakefs/data/root/.dsh/profiles/web/cordis.patch.yml" ] || die "the web profile was never scaffolded in the guest"
-[ -d "$WORK/fakefs/data/root/workspace" ] || die "the guest workspace was never created"
-[ -x "$WORK/fakefs/data/usr/local/bin/dsh-serve" ] || die "dsh-serve is missing from the guest image"
+guest_has /usr/local/lib/node_modules/node-pty/build/Release/pty.node || die "node-pty was not rebuilt for musl — the terminal would not work"
+guest_has /root/.dsh/profiles/web/cordis.patch.yml || die "the web profile was never scaffolded in the guest"
+guest_has /root/workspace || die "the guest workspace was never created"
+guest_has /usr/local/bin/dsh-serve || die "dsh-serve is missing from the guest image"
 
 log "Export root.tar.gz"
 rm -f "$OUT"
