@@ -20,10 +20,15 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
       - name: Install dependencies
         run: |
-          brew install meson ninja lld node
+          brew install meson ninja lld node libarchive
+          echo "PKG_CONFIG_PATH=$(brew --prefix libarchive)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
           sudo gem install xcodeproj --no-document
       - name: Compile emulator
-        run: make emulator
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          make emulator
+          test -x ish-arm64/build-arm64-release/tools/fakefsify
+          test -x ish-arm64/build-arm64-release/tools/unfakefsify
       - name: Generate Alpine rootfs
         run: make rootfs
       - name: Generate Xcode project
