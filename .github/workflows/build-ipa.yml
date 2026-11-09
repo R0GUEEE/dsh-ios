@@ -1,0 +1,46 @@
+name: Build unsigned DSH IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Select Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Install dependencies
+        run: |
+          brew install meson ninja lld node
+          sudo gem install xcodeproj --no-document
+      - name: Compile emulator
+        run: make emulator
+      - name: Generate Alpine rootfs
+        run: make rootfs
+      - name: Generate Xcode project
+        run: make project
+      - name: Build unsigned application
+        run: |
+          xcodebuild -project DSH.xcodeproj -scheme DSH -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Package IPA
+        run: |
+          APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)
+          test -n "$APP"
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          cd build/ipa
+          zip -qry DSH-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DSH-unsigned-ipa
+          path: build/ipa/DSH-unsigned.ipa
+          if-no-files-found: error
