@@ -104,18 +104,35 @@ jobs:
             rootfs-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Verify guest image
+        shell: bash
         run: |
+          set -o pipefail
           test -s build/root.tar.gz
           ls -lh build/root.tar.gz
           # Check the tarball really carries the launcher, the dsh tree and the
           # bridge plugin: a cached or partially written image must not pass.
-          LIST=$(tar tzf build/root.tar.gz)
+          # tar member names are reported exactly as stored, so match on the
+          # suffix rather than assuming a leading "./".
+          LIST=build/root.members.txt
+          tar tzf build/root.tar.gz > "$LIST"
+          echo "members: $(wc -l < "$LIST")"
+          missing=0
           for path in \
-            ./usr/local/bin/dsh-serve \
-            ./usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js \
-            ./usr/local/share/dsh/home.patch.yml; do
-            echo "$LIST" | grep -qxF "$path" || { echo "::error::root.tar.gz is missing $path"; exit 1; }
+            usr/local/bin/dsh-serve \
+            usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js \
+            usr/local/share/dsh/home.patch.yml; do
+            if grep -qE "(^|/)${path}$" "$LIST"; then
+              echo "ok   $path"
+            else
+              echo "::error::root.tar.gz is missing $path"
+              missing=1
+            fi
           done
+          if [ "$missing" != 0 ]; then
+            echo "--- first members:"
+            head -20 "$LIST"
+            exit 1
+          fi
           echo "guest image looks complete"
 
       - name: Restore DerivedData
