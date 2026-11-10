@@ -81,7 +81,15 @@ else
 fi
 
 echo "== profile composition"
-guest 'export HOME=/root; node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --dump-config' > "$WORK/config.yml"
+# Composing the patch layers needs only node and the pinned dsh tree; it does
+# not need the emulator, the guest, or macOS. Run it on the host when one is
+# available, so the guest configuration has a gate that a Linux box can run.
+if [ -n "${DSH_CONFIG_ONLY_HOST:-}" ] && [ -x /usr/bin/node ]; then
+    echo "   (composing on the host via $DSH_HOST_DSH)"
+    HOME="$WORK/home" node --expose-internals "$DSH_HOST_DSH" --profile web --dump-config > "$WORK/config.yml"
+else
+    guest 'export HOME=/root; node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --dump-config' > "$WORK/config.yml"
+fi
 grep -A4 '^- id: sandbox-policy' "$WORK/config.yml" > "$WORK/sandbox-row.yml"
 check "sandbox-policy patched to danger-full-access" grep -q 'danger-full-access' "$WORK/sandbox-row.yml"
 check "hmr row present (needs --expose-internals)"    grep -q 'cordis-plugin-hmr' "$WORK/config.yml"
