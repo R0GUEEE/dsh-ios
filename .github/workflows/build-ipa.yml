@@ -99,9 +99,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/root.tar.gz
-          key: rootfs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rootfs/staging/package.json', 'rootfs/staging/package-lock.json', 'rootfs/overlay/**', 'scripts/build-rootfs.sh', 'scripts/gen-image-manifest.py') }}
+          key: rootfs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rootfs/staging/package.json', 'rootfs/staging/package-lock.json', 'rootfs/overlay/**', 'scripts/build-rootfs.sh') }}
           restore-keys: |
             rootfs-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Generate Alpine rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: make rootfs
 
       - name: Verify guest image
         shell: bash
