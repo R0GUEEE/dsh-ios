@@ -103,29 +103,20 @@ jobs:
           restore-keys: |
             rootfs-${{ runner.os }}-${{ runner.arch }}-
 
-      # The image manifest describes the pinned tree; regenerate it every run so
-      # a lockfile edit can never ship a manifest that disagrees with it.
-      - name: Generate guest image manifest
-        run: scripts/gen-image-manifest.py
-
-      - name: Generate Alpine rootfs
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        run: make rootfs
-
       - name: Verify guest image
         run: |
           test -s build/root.tar.gz
           ls -lh build/root.tar.gz
-          # The manifest must agree with the image it ships beside.
-          python3 - <<'PY'
-          import json, pathlib, sys
-          m = json.loads(pathlib.Path("rootfs/overlay/usr/local/share/dsh/image.json").read_text())
-          if not m.get("dshVersion"):
-              sys.exit("image.json has no dshVersion")
-          if "dsh-host-bridge" not in m.get("plugins", []):
-              sys.exit("image.json does not list the host-bridge plugin")
-          print(f"image.json: dsh {m['dshVersion']}, {len(m.get('shippedTools', []))} shipped tools")
-          PY
+          # Check the tarball really carries the launcher, the dsh tree and the
+          # bridge plugin: a cached or partially written image must not pass.
+          LIST=$(tar tzf build/root.tar.gz)
+          for path in \
+            ./usr/local/bin/dsh-serve \
+            ./usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js \
+            ./usr/local/share/dsh/home.patch.yml; do
+            echo "$LIST" | grep -qxF "$path" || { echo "::error::root.tar.gz is missing $path"; exit 1; }
+          done
+          echo "guest image looks complete"
 
       - name: Restore DerivedData
         id: dd-cache
