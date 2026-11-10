@@ -62,6 +62,11 @@ jobs:
       # The project's "Copy DSH Root" phase refuses to run without the guest
       # image. A stub satisfies it: nothing in this job boots the guest, and
       # compiling the app only needs the file to exist.
+      # Runs before anything macOS-specific: it needs only Python and clang,
+      # so a failure here is a real code error rather than a toolchain one.
+      - name: Type-check changed Objective-C
+        run: python3 scripts/objc-syntax-check.py
+
       - name: Stub guest image
         run: |
           mkdir -p build

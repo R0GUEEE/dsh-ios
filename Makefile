@@ -25,7 +25,7 @@ BUNDLE_ID ?= com.xnuapp.dsh
 XCB        = xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Release DSH_DEVELOPMENT_TEAM=$(TEAM)
 DERIVED    = $(shell ls -dt ~/Library/Developer/Xcode/DerivedData/DSH-*/Build/Products 2>/dev/null | head -1)
 
-.PHONY: all emulator rootfs project app install run test test-emu test-rootfs test-sim test-device test-device-unit archive release clean
+.PHONY: all emulator rootfs project app install run test test-emu test-objc test-rootfs test-sim test-device test-device-unit archive release clean
 
 all: emulator rootfs project app
 
@@ -59,6 +59,12 @@ test: test-emu test-rootfs test-sim
 test-emu: emulator
 	tests/emu-test.sh
 	tests/scripts-test.sh
+
+# Type-checks the Objective-C this repo changes against a generated stub SDK.
+# Catches undeclared selectors and unknown constants without a Mac; it does not
+# replace xcodebuild, which is what proves the app links and launches.
+test-objc:
+	python3 scripts/objc-syntax-check.py
 
 test-rootfs: emulator
 	tests/rootfs-test.sh
