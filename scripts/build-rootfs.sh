@@ -83,7 +83,15 @@ rm -rf payload/usr/local/lib/node_modules/@img/sharp-linux-arm64 \
 cp "$ISH_SRC"/app/RootfsPatch.bundle/files/lib/*.js payload/lib/
 # Record the overlay version so the app does not re-apply (and downgrade) the
 # same RootfsPatch files on first launch.
-overlay_ver=$(/usr/libexec/PlistBuddy -c 'Print :version' "$ISH_SRC/app/RootfsPatch.bundle/manifest.plist")
+# PlistBuddy is macOS-only; the version is a single integer in a small XML
+# plist, so read it with whichever tool the building host has.
+MANIFEST_PLIST="$ISH_SRC/app/RootfsPatch.bundle/manifest.plist"
+if [ -x /usr/libexec/PlistBuddy ]; then
+    overlay_ver=$(/usr/libexec/PlistBuddy -c 'Print :version' "$MANIFEST_PLIST")
+else
+    overlay_ver=$(sed -n 's:.*<integer>\([0-9][0-9]*\)</integer>.*:\1:p' "$MANIFEST_PLIST" | head -1)
+fi
+[ -n "$overlay_ver" ] || { echo "cannot read the overlay version from $MANIFEST_PLIST" >&2; exit 1; }
 mkdir -p payload/ish && printf '%s\n' "$overlay_ver" > payload/ish/overlay-version
 cp -R "$ROOT/rootfs/overlay/." payload/
 find payload -name '._*' -delete
@@ -121,7 +129,11 @@ log "Export root.tar.gz"
 rm -f "$OUT"
 "$ISH_BUILD/tools/unfakefsify" fakefs "$OUT"
 ls -lh "$OUT"
-shasum -a 256 "$OUT" | tee "$OUT.sha256"
+if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$OUT" | tee "$OUT.sha256"
+else
+    sha256sum "$OUT" | tee "$OUT.sha256"
+fi
 
 if [ "${1:-}" != "--keep-work" ]; then
     rm -rf stage payload payload.tgz
