@@ -35,6 +35,9 @@ static NSString *const kDSHUserAgentSuffix = @" DSH-iOS/1.0";
 @property (nonatomic) BOOL pageLoaded;
 @property (nonatomic) NSUInteger pageLoadGeneration;
 @property (nonatomic) NSMutableDictionary<NSValue *, NSURL *> *downloadDestinations;
+/// The one place every menu sheet goes through (see the implementation).
+- (nullable UIViewController *)presenterForSheet;
+- (void)presentSheet:(UIViewController *)controller;
 @end
 
 @implementation DSHRootViewController
@@ -363,25 +366,55 @@ static NSString *const kDSHUserAgentSuffix = @" DSH-iOS/1.0";
     [self presentViewController:self.terminalVC animated:YES completion:nil];
 }
 
+/// The controller a sheet should attach to, or nil when something is already
+/// up. Presenting a second modal on a controller that is presenting is a
+/// silent no-op with a console warning, which reads to the user as "the menu
+/// item did nothing" — and the terminal, Capabilities, Activity and Server Log
+/// all sit behind the same menu, so two taps in a row hit it every time.
+- (nullable UIViewController *)presenterForSheet {
+    UIViewController *top = self;
+    while (top.presentedViewController != nil)
+        top = top.presentedViewController;
+    // A presented controller that is itself mid-dismissal still reports as
+    // presented for a frame; `isBeingDismissed` is the honest answer.
+    return top.isBeingDismissed ? nil : top;
+}
+
+/// One path for every menu sheet: same presentation style, same guard, and the
+/// caller never has to know whether something else was already up.
+- (void)presentSheet:(UIViewController *)controller {
+    UIViewController *presenter = [self presenterForSheet];
+    if (presenter == nil)
+        return;
+    controller.modalPresentationStyle = UIModalPresentationPageSheet;
+    // A page sheet on iPad is the right size already: it leaves the harness
+    // visible behind it. On iPhone it covers the whole screen for what is a
+    // short settings list, so those get a large detent instead — still tall
+    // enough for the longest list, but with the grabber and the ability to
+    // pull it up or put it away by dragging.
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) {
+        if (@available(iOS 15.0, *)) {
+            UISheetPresentationController *sheet = controller.sheetPresentationController;
+            sheet.detents = @[UISheetPresentationControllerDetent.largeDetent];
+            sheet.prefersGrabberVisible = YES;
+        }
+    }
+    [presenter presentViewController:controller animated:YES completion:nil];
+}
+
 - (void)presentLog {
     DSHLogViewController *vc = [[DSHLogViewController alloc] initWithLog:DSHHarness.shared.log];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [self presentViewController:nav animated:YES completion:nil];
+    [self presentSheet:[[UINavigationController alloc] initWithRootViewController:vc]];
 }
 
 - (void)presentCapabilities {
     DSHCapabilitiesViewController *vc = [DSHCapabilitiesViewController new];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [self presentViewController:nav animated:YES completion:nil];
+    [self presentSheet:[[UINavigationController alloc] initWithRootViewController:vc]];
 }
 
 - (void)presentActivity {
     DSHActivityViewController *vc = [DSHActivityViewController new];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [self presentViewController:nav animated:YES completion:nil];
+    [self presentSheet:[[UINavigationController alloc] initWithRootViewController:vc]];
 }
 
 - (void)presentAbout {
@@ -393,9 +426,19 @@ static NSString *const kDSHUserAgentSuffix = @" DSH-iOS/1.0";
                          @"DSH %@\n\nDeepSeek Harness running in an Alpine Linux guest (iSH ARM64 emulator) inside this app.\n\nServer: %@\nState: %@\nStartup: %.1fs · restarts: %lu\n\n%@",
                          version, h.baseURL.absoluteString ?: @"–", DSHHarnessStateName(h.state), h.lastStartupDuration,
                          (unsigned long) h.restartCount, DSHStartupMetrics.shared.summary];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"About DSH" message:message preferredStyle:UIAlertControllerStyleAlert];
+    // Action sheet, not alert: an alert caps its message at a narrow column and
+    // clips whatever runs past it, which is exactly the multi-line status block
+    // above. A sheet lays the same text out at the width of the screen.
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"About DSH" message:message preferredStyle:UIAlertControllerStyleActionSheet];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    // An action sheet on iPad is a popover and needs an anchor, or it crashes
+    // on presentation; the menu button is what opened this. Exactly one anchor
+    // source may be set — barButtonItem would override sourceView and the
+    // route through a plain UIButton is the one that is always valid here.
+    alert.popoverPresentationController.sourceView = self.menuButton;
+    alert.popoverPresentationController.sourceRect = self.menuButton.bounds;
+    alert.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionUp;
+    [self presentSheet:alert];
 }
 
 #pragma mark - A turn that did not survive the background

@@ -1,0 +1,6 @@
+{
+  "//": "MCP servers for DSH on iOS. Edit this file, then restart the harness (or run 'dsh ios-mcp reload' in the terminal). One entry per server; the key is the server name and appears in tool names as mcp__<name>__<tool>.",
+  "//transport": "stdio: needs command + args, runs inside the guest (npx/npm work). streamable-http: needs an absolute url.",
+  "//env": "Values may reference $NAME from the guest environment, e.g. \"GITHUB_TOKEN\": \"$GITHUB_TOKEN\".",
+  "servers": {}
+}

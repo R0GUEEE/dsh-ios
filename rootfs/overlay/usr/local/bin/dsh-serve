@@ -24,6 +24,28 @@ install -m 0644 /usr/local/share/dsh/home.patch.yml "$DSH_HOME/cordis.patch.yml"
 
 cd "$DSH_WORKSPACE"
 
+# Plugin platform. `dsh plugin add <name>` runs pnpm inside the profile
+# directory, so the pinned tree at /usr/local/lib/node_modules is invisible to
+# it and every name looks like an unknown package. Expose the tree on NODE_PATH
+# instead of copying it into the profile: the profile directory belongs to the
+# agent, and a second copy there would both double the image's install time and
+# give the agent a writable copy of the very packages it is told to mount.
+# Precedence is still the agent's: Node resolves ./node_modules before
+# NODE_PATH, so a plugin the profile really fetched wins over this tree.
+DSH_NODE_MODULES=/usr/local/lib/node_modules
+export NODE_PATH="$DSH_NODE_MODULES${NODE_PATH:+:$NODE_PATH}"
+
+# Settings the app writes (never the agent — see DSHActivityLog and
+# docs/host-bridge.md) reach the in-guest policy through these paths.
+export DSH_IMAGE_MANIFEST=/usr/local/share/dsh/image.json
+export DSH_IOS_SETTINGS="${DSH_IOS_SETTINGS:-$DSH_HOME/ios.json}"
+# MCP servers the user configured. Seeded once from the image's example on
+# first launch, then owned by the user: an update never overwrites it.
+export DSH_MCP_CONFIG="${DSH_MCP_CONFIG:-$DSH_HOME/mcp.json}"
+if [ ! -f "$DSH_MCP_CONFIG" ] && [ -f /usr/local/share/dsh/mcp.example.json ]; then
+    install -m 0644 /usr/local/share/dsh/mcp.example.json "$DSH_MCP_CONFIG"
+fi
+
 # --expose-internals: cordis-plugin-hmr needs Node internals; the prebuilt
 # node-addon-require-builtin shim has no musl build, so use the flag instead.
 exec node --expose-internals \

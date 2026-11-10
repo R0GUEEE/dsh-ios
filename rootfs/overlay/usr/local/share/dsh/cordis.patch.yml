@@ -19,3 +19,37 @@
       danger-full-access:
         sandbox: danger-full-access
         approval: never
+
+# ── skills ──────────────────────────────────────────────────────────────────
+#
+# Where skills come from, in the order the provider ranks them:
+#
+#   <project>/.dsh/skills      project skills the agent can create (rank 100)
+#   ~/.dsh/skills              user skills, survive image updates (rank 400)
+#   /usr/local/share/dsh/skills  bundled with the image (rank 900, lowest)
+#
+# The bundled root is the point: a fresh install has *something* to call, and
+# a user skill of the same name shadows it rather than colliding. No write
+# path into the bundled root exists, so an image update can replace it
+# wholesale without touching anything the user wrote.
+#
+# `watch` is on because skill files are ordinary files the agent edits; the
+# provider then picks up a new SKILL.md without a restart. Polling is used
+# instead of native file events: inotify inside iSH costs a thread per watch
+# and the guest is single-threaded by default (UV_THREADPOOL_SIZE=1).
+#
+# `customSkillDirs` and `bundledSkillDir` are deliberately the SAME directory:
+# the provider registers both with includeDefaultRoots, so naming two nested
+# paths would load every skill twice under different ranks.
+- id: skill-filesystem
+  config:
+    includeDefaultRoots: true
+    dshHome: !!js process.env.DSH_HOME ?? '/root/.dsh'
+    agentsHome: '/root/.agents'
+    customSkillDirs: []
+    bundledSkillDir: /usr/local/share/dsh/skills
+    watch: true
+    watchUsePolling: true
+    # iSH's file events are emulated on top of a polling harness; a short
+    # interval multiplies wakeups across every open project.
+    watchPollIntervalMs: 1000

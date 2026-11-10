@@ -6,3 +6,19 @@
 - insert:
     - id: host-bridge
       name: /usr/local/lib/dsh-plugins/dsh-host-bridge/index.js
+
+    # The plugin-platform layer: publishes this image's runtime (the pinned
+    # dsh) to anything that judges plugin compatibility, and installs the
+    # monotonic tool guard that keeps a profile-mounted plugin from shadowing
+    # a bridge tool or from running in conflict with the app's settings.
+    # It registers nothing when /usr/local/share/dsh/image.json is absent, so
+    # the image still runs outside the app.
+    - id: ios-platform
+      name: /usr/local/lib/dsh-plugins/dsh-ios/index.js
+
+    # Mounts the user's MCP servers from ~/.dsh/mcp.json. One mcp-client row per
+    # entry, because each server needs its own serverName and the number of
+    # servers is the user's, not the build's. Reads nothing when the file is
+    # absent, so a fresh install mounts no MCP servers and stays quiet.
+    - id: ios-mcp
+      name: /usr/local/lib/dsh-plugins/dsh-ios-mcp/index.js
