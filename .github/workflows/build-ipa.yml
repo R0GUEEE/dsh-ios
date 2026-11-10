@@ -1,51 +1,187 @@
 name: Build unsigned DSH IPA
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths-ignore: ['**/*.md', 'docs/**']
+
 permissions:
   contents: read
+
+# One build per ref. A second push to the same branch cancels the first:
+# the artifact it would have produced is already stale.
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 120
+    env:
+      # Pinned so a cache restore never crosses toolchain versions. Bump when
+      # the emulator's build inputs change; that intentionally invalidates both
+      # caches and costs one cold build.
+      EMULATOR_CACHE_EPOCH: v1
+      PKG_CONFIG_PATH: /opt/homebrew/opt/libarchive/lib/pkgconfig
     steps:
       - uses: actions/checkout@v4
+
+      # Homebrew's cache is keyed by the formula set, so a warm runner image or
+      # a restored bottle dir skips compiling meson/ninja/node from source.
+      - name: Cache Homebrew downloads and build dependencies
+        uses: actions/cache@v4
         with:
-          submodules: recursive
-      - name: Select Xcode
-        run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-      - name: Install dependencies
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/build-ipa.yml') }}
+          restore-keys: |
+            brew-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install build dependencies
         run: |
           brew install meson ninja lld node libarchive
-          echo "PKG_CONFIG_PATH=$(brew --prefix libarchive)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
-          sudo gem install xcodeproj --no-document
+          # Installed only when missing: `gem install` on a warm image is pure
+          # latency, and the constant is what the project generator needs.
+          gem list -i xcodeproj >/dev/null 2>&1 || sudo gem install xcodeproj --no-document
+
+      - name: Select Xcode
+        id: xcode
+        run: |
+          # The runner's default may be an RC; pin to the newest stable iPhoneOS
+          # SDK present and record it, because the DerivedData cache key needs it.
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+          echo "xcode=$XCODE_PATH" >> "$GITHUB_OUTPUT"
+          echo "sdk=$(xcrun --sdk iphoneos --show-sdk-version)" >> "$GITHUB_OUTPUT"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # The emulator is the expensive step (~10 min cold). It depends only on
+      # its own vendored sources and the build options, never on app code, so an
+      # unchanged emulator tree reuses the compiled CLI and the rootfs step gets
+      # it for free.
+      - name: Restore compiled emulator
+        id: emu-cache
+        uses: actions/cache@v4
+        with:
+          path: ish-arm64/build-arm64-release
+          key: emu-${{ env.EMULATOR_CACHE_EPOCH }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ish-arm64/meson.build', 'ish-arm64/meson_options.txt', 'ish-arm64/**/*.c', 'ish-arm64/**/*.h', 'ish-arm64/**/*.S') }}
+          restore-keys: |
+            emu-${{ env.EMULATOR_CACHE_EPOCH }}-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Compile emulator
         run: |
-          export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           make emulator
+          # A restored cache can be structurally stale (meson version drift,
+          # half-written build dir). Validate the artefacts, and on failure do
+          # one clean build rather than shipping a broken binary.
+          if ! test -x ish-arm64/build-arm64-release/tools/fakefsify \
+             || ! test -x ish-arm64/build-arm64-release/tools/unfakefsify \
+             || ! test -x ish-arm64/build-arm64-release/ish; then
+            echo "cached emulator incomplete — rebuilding clean"
+            rm -rf ish-arm64/build-arm64-release
+            make emulator
+          fi
           test -x ish-arm64/build-arm64-release/tools/fakefsify
           test -x ish-arm64/build-arm64-release/tools/unfakefsify
-      - name: Generate Alpine rootfs
-        run: make rootfs
+          ish-arm64/build-arm64-release/ish --version || true
+
       - name: Generate Xcode project
         run: make project
-      - name: Build unsigned application
+
+      # Dependent on the project graph, the pinned npm manifest, and the
+      # overlay, so an app-only change reuses the guest image.
+      - name: Restore guest rootfs
+        id: rootfs-cache
+        uses: actions/cache@v4
+        with:
+          path: build/root.tar.gz
+          key: rootfs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rootfs/staging/package.json', 'rootfs/staging/package-lock.json', 'rootfs/overlay/**', 'scripts/build-rootfs.sh', 'scripts/gen-image-manifest.py') }}
+          restore-keys: |
+            rootfs-${{ runner.os }}-${{ runner.arch }}-
+
+      # The image manifest describes the pinned tree; regenerate it every run so
+      # a lockfile edit can never ship a manifest that disagrees with it.
+      - name: Generate guest image manifest
+        run: scripts/gen-image-manifest.py
+
+      - name: Generate Alpine rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: make rootfs
+
+      - name: Verify guest image
         run: |
-          xcodebuild -project DSH.xcodeproj -scheme DSH -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO build
+          test -s build/root.tar.gz
+          ls -lh build/root.tar.gz
+          # The manifest must agree with the image it ships beside.
+          python3 - <<'PY'
+          import json, pathlib, sys
+          m = json.loads(pathlib.Path("rootfs/overlay/usr/local/share/dsh/image.json").read_text())
+          if not m.get("dshVersion"):
+              sys.exit("image.json has no dshVersion")
+          if "dsh-host-bridge" not in m.get("plugins", []):
+              sys.exit("image.json does not list the host-bridge plugin")
+          print(f"image.json: dsh {m['dshVersion']}, {len(m.get('shippedTools', []))} shipped tools")
+          PY
+
+      - name: Restore DerivedData
+        id: dd-cache
+        uses: actions/cache@v4
+        with:
+          path: build/DerivedData
+          # `hashFiles` takes file globs only, so the Xcode/SDK identity is part
+          # of the key as a literal, not through a step output.
+          key: dd-${{ runner.os }}-${{ steps.xcode.outputs.sdk }}-${{ hashFiles('app/**', 'DSH.xcodeproj/**', 'scripts/gen-xcode-project.rb') }}
+          restore-keys: |
+            dd-${{ runner.os }}-${{ steps.xcode.outputs.sdk }}-
+            dd-${{ runner.os }}-
+
+      - name: Build unsigned application
+        shell: bash
+        run: |
+          set -o pipefail
+          # No `clean`: incremental against the restored DerivedData is the
+          # point of the cache. Signing stays off so no secrets are needed.
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ENABLE_BITCODE=NO \
+            build 2>&1 | tee build/xcodebuild.log
+
       - name: Package IPA
         run: |
+          set -euo pipefail
           APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)
-          test -n "$APP"
-          mkdir -p build/ipa/Payload
+          if [ -z "$APP" ]; then
+            echo "::error::xcodebuild produced no .app — see build/xcodebuild.log"
+            tail -50 build/xcodebuild.log
+            exit 1
+          fi
+          echo "app: $APP"
+          test -x "$APP/DSH" || { echo "::error::missing executable in $APP"; exit 1; }
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
-          cd build/ipa
-          zip -qry DSH-unsigned.ipa Payload
+          # An unsigned build carries no signature; strip any stale one so the
+          # resulting IPA is unambiguously unsigned (sideloaders expect this).
+          rm -rf build/ipa/Payload/*.app/_CodeSignature
+          cd build/ipa && zip -qry DSH-unsigned.ipa Payload
+          cd - >/dev/null
+          shasum -a 256 build/ipa/DSH-unsigned.ipa
+
       - uses: actions/upload-artifact@v4
         with:
           name: DSH-unsigned-ipa
-          path: build/ipa/DSH-unsigned.ipa
+          path: |
+            build/ipa/DSH-unsigned.ipa
+            build/xcodebuild.log
           if-no-files-found: error
+          retention-days: 14
