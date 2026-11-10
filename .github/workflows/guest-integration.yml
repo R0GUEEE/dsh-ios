@@ -1,0 +1,122 @@
+name: Guest integration (Linux)
+
+# Runs the rootfs integration suite where it does not have to compete for a
+# macOS runner.
+#
+# That suite is the only one that exercises the guest configuration: the
+# cordis patch layers, the bundled skills, the MCP loader, the image manifest,
+# and a real agent turn through a stub host bridge. It was macOS-only because
+# build-rootfs.sh reached for PlistBuddy and shasum, and because the Makefile
+# demanded ld.lld. Both are now host-neutral, and the emulator itself builds
+# and boots on Linux (verified: uname reports aarch64 inside the guest).
+#
+# This does NOT replace build-ipa.yml: the iOS app still needs macOS and Xcode.
+# It exists so a guest-side regression is caught on a runner that is actually
+# available.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'ci/**']
+    paths:
+      - 'rootfs/**'
+      - 'scripts/build-rootfs.sh'
+      - 'scripts/gen-image-manifest.py'
+      - 'ish-arm64/**'
+      - 'tests/rootfs-test.sh'
+      - 'tests/mock-deepseek.mjs'
+      - 'tests/stub-bridge.mjs'
+      - '.github/workflows/guest-integration.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld meson ninja-build pkg-config \
+            libarchive-dev libsqlite3-dev libc6-dev zlib1g-dev \
+            ca-certificates curl unzip
+
+      # The two gaps between this tree and a stock Linux toolchain: Darwin's
+      # st_*timespec names and F_GETPATH. Kept here rather than in the repo so
+      # the iOS build is untouched; the shim is C-only, because -include also
+      # reaches the assembler and the aarch64 gadget macros must not see it.
+      - name: Host shim for the Linux build
+        run: |
+          mkdir -p /tmp/hs
+          cat > /tmp/hs/lnx.h <<'EOF'
+          #ifndef DSH_LNX_SHIM
+          #define DSH_LNX_SHIM
+          #if defined(__STDC__) && !defined(__ASSEMBLER__)
+          #include <stdio.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <limits.h>
+          #include <sys/stat.h>
+          #define st_atimespec st_atim
+          #define st_mtimespec st_mtim
+          #define st_ctimespec st_ctim
+          #ifndef F_GETPATH
+          #define F_GETPATH 50
+          #endif
+          #endif
+          #endif
+          EOF
+          echo "CFLAGS=-I/tmp/hs" >> "$GITHUB_ENV"
+
+      - name: Build the emulator CLI
+        run: |
+          cd ish-arm64
+          CC=clang meson setup build-arm64-release \
+            -Dguest_arch=arm64 --buildtype=release -Dc_args=-I/tmp/hs
+          # Only the C rule may see the shim; the .S rule would choke on it.
+          python3 - <<'PY'
+          p = 'build-arm64-release/build.ninja'
+          s = open(p).read()
+          s = s.replace('rule c_COMPILER\n command = clang $ARGS',
+                        'rule c_COMPILER\n command = clang $ARGS -include /tmp/hs/lnx.h')
+          open(p, 'w').write(s)
+          PY
+          ninja -C build-arm64-release
+          ./build-arm64-release/ish --version || true
+
+      # The hardware CPU counters file is generated during the build and the
+      # suite re-runs the emulator itself, so prove it boots a shell first.
+      - name: Smoke-test the emulator
+        run: |
+          ish-arm64/build-arm64-release/ish /bin/sh -c 'echo GUEST-OK; uname -m' | tee /tmp/smoke.txt
+          grep -q GUEST-OK /tmp/smoke.txt
+
+      - name: Build the guest rootfs
+        run: |
+          chmod +x scripts/*.sh
+          scripts/build-rootfs.sh
+          ls -lh build/root.tar.gz
+
+      - name: Run the rootfs integration suite
+        run: |
+          chmod +x tests/*.sh
+          # The suite spawns the emulator many times; a hosted runner's disk is
+          # fine but its /tmp is small, so the work dir stays under build/.
+          WORK="$PWD/build/rootfs-test" tests/rootfs-test.sh 2>&1 | tee build/rootfs-test.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guest-integration-log
+          path: build/rootfs-test.log
+          if-no-files-found: warn
+          retention-days: 14

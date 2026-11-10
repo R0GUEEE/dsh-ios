@@ -6,7 +6,28 @@
 #include "util/signpost.h"
 #include <termios.h>
 #include <unistd.h>
+#if defined(__APPLE__)
 #include <mach/mach.h>
+// Darwin exposes the interrupted registers through __ss/__es.
+#define UC_REG(i)  (uc->uc_mcontext->__ss.__x[i])
+#define UC_SP(v)   (uc->uc_mcontext->__ss.__sp = (v))
+#define UC_PC(v)   (uc->uc_mcontext->__ss.__pc = (v))
+#define UC_ESR     (uc->uc_mcontext->__es.__esr)
+#define UC_PC_V    (uc->uc_mcontext->__ss.__pc)
+#define UC_SP_V    (uc->uc_mcontext->__ss.__sp)
+#define UC_LR      (uc->uc_mcontext->__ss.__lr)
+#else
+// The Linux CLI keeps the same recovery path so the emulator can be built and
+// tested on a Linux runner; ucontext_t names the fields directly there.
+#include <ucontext.h>
+#define UC_REG(i)  (uc->uc_mcontext.regs[i])
+#define UC_SP(v)   (uc->uc_mcontext.sp = (unsigned long)(v))
+#define UC_PC(v)   (uc->uc_mcontext.pc = (unsigned long)(v))
+#define UC_ESR     (uc->uc_mcontext.fault_address)
+#define UC_PC_V    (uc->uc_mcontext.pc)
+#define UC_SP_V    (uc->uc_mcontext.sp)
+#define UC_LR      (uc->uc_mcontext.regs[30])
+#endif
 #include <pthread.h>
 #include "kernel/calls.h"
 #include "kernel/task.h"
@@ -44,13 +65,13 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         ucontext_t *uc = (ucontext_t *)ctx;
 
         // _cpu is in x1 — pointer to cpu_state within fiber_frame
-        uint64_t cpu_ptr = uc->uc_mcontext->__ss.__x[1];
+        uint64_t cpu_ptr = UC_REG(1);
 
         // Reconstruct guest segfault_addr from registers.
         // x7 = _addr (host pointer = data_minus_addr + guest_addr)
         // x10 may hold data_minus_addr from TLB lookup (but only on TLB HIT path)
-        uint64_t x7 = uc->uc_mcontext->__ss.__x[7];
-        uint64_t x10 = uc->uc_mcontext->__ss.__x[10];
+        uint64_t x7 = UC_REG(7);
+        uint64_t x10 = UC_REG(10);
         uint64_t guest_addr = (x7 - x10) & 0xffffffffffffULL;
 
         // Store diagnostic info for handle_interrupt to read
@@ -60,7 +81,7 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         jit_crash_count++;
 
         // Determine read/write from host ESR. Bit 6 (WnR): 0=read, 1=write.
-        uint64_t esr = uc->uc_mcontext->__es.__esr;
+        uint64_t esr = UC_ESR;
         int was_write = (esr & 0x40) != 0;
 
         // Write crash info directly to cpu_state via _cpu pointer
@@ -72,10 +93,10 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         // Restore SP to the value saved by fiber_enter, so fiber_exit
         // can correctly pop the callee-saved register frame.
         uint64_t exit_sp = *(uint64_t *)(cpu_ptr + CRASH_LOCAL_jit_exit_sp);
-        uc->uc_mcontext->__ss.__sp = exit_sp;
+        UC_SP(exit_sp);
 
         // Redirect execution to crash trampoline (returns INT_JIT_CRASH)
-        uc->uc_mcontext->__ss.__pc = (uint64_t)jit_crash_trampoline;
+        UC_PC(jit_crash_trampoline);
 
         // Unblock signal so it can fire again on next crash
         sigset_t unblock;
@@ -99,11 +120,11 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         "pc:  0x%llx\nlr:  0x%llx\nsp:  0x%llx\n"
         "x0:  0x%llx\nx1:  0x%llx\nx2:  0x%llx\n"
         "x7:  0x%llx\nx28: 0x%llx\n",
-        uc->uc_mcontext->__ss.__pc, uc->uc_mcontext->__ss.__lr,
-        uc->uc_mcontext->__ss.__sp,
-        uc->uc_mcontext->__ss.__x[0], uc->uc_mcontext->__ss.__x[1],
-        uc->uc_mcontext->__ss.__x[2],
-        uc->uc_mcontext->__ss.__x[7], uc->uc_mcontext->__ss.__x[28]);
+        UC_PC_V, UC_LR,
+        UC_SP_V,
+        UC_REG(0), UC_REG(1),
+        UC_REG(2),
+        UC_REG(7), UC_REG(28));
     write(STDERR_FILENO, buf, len);
 #endif
     void *bt[20];

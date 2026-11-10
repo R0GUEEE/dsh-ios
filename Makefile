@@ -31,12 +31,17 @@ all: emulator rootfs project app
 
 # libapps and libarchive are vendored (they were submodules upstream), so there
 # is nothing to fetch — a fresh clone can build straight away.
+# macOS needs LLVM's linker for the guest VDSO. On Linux the host linker does
+# that job, but meson must be told to use clang: it prefers the system cc, and
+# gcc cannot assemble the aarch64 gadget macros.
 emulator:
-	@command -v ld.lld >/dev/null || { \
-	    echo "error: ld.lld not found — the guest VDSO needs LLVM's linker."; \
-	    echo "       brew install lld   (and make sure its bin directory is on PATH)"; \
-	    exit 1; }
-	cd $(ISH_SRC) && { [ -d build-arm64-release ] || meson setup build-arm64-release -Dguest_arch=arm64 --buildtype=release; }
+	@if [ "$$(uname -s)" = Darwin ]; then \
+	    command -v ld.lld >/dev/null || { \
+	        echo "error: ld.lld not found — the guest VDSO needs LLVM's linker."; \
+	        echo "       brew install lld   (and make sure its bin directory is on PATH)"; \
+	        exit 1; }; \
+	fi
+	cd $(ISH_SRC) && { [ -d build-arm64-release ] || CC=clang meson setup build-arm64-release -Dguest_arch=arm64 --buildtype=release; }
 	ninja -C $(ISH_BUILD)
 
 rootfs: emulator
