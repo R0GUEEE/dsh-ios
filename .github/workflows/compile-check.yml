@@ -1,0 +1,115 @@
+name: Compile check
+
+# Answers one question cheaply: does the app compile?
+#
+# The full IPA job needs a macOS runner for ~10 minutes (emulator, guest image,
+# archive, package, upload). When hosted macOS capacity is scarce that job
+# simply expires in the queue, which says nothing about the code. This one runs
+# the same xcodebuild invocation against a stub guest image, so it needs a
+# runner for a couple of minutes and fails on exactly the thing a human needs
+# to know: a compiler error.
+#
+# It does NOT produce an installable app and does not replace build-ipa.yml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'ci/**']
+    paths:
+      - 'app/**'
+      - 'scripts/gen-xcode-project.rb'
+      - 'ish-arm64/**'
+      - '.github/workflows/compile-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      EMULATOR_CACHE_EPOCH: v1
+      PKG_CONFIG_PATH: /opt/homebrew/opt/libarchive/lib/pkgconfig
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/build-ipa.yml') }}
+          restore-keys: |
+            brew-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install build dependencies
+        run: |
+          brew install meson ninja lld libarchive
+          gem list -i xcodeproj >/dev/null 2>&1 || sudo gem install xcodeproj --no-document
+
+      - name: Select Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      # The project's "Copy DSH Root" phase refuses to run without the guest
+      # image. A stub satisfies it: nothing in this job boots the guest, and
+      # compiling the app only needs the file to exist.
+      - name: Stub guest image
+        run: |
+          mkdir -p build
+          printf 'stub\n' > build/root.tar.gz
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Restore DerivedData
+        uses: actions/cache@v4
+        with:
+          path: build/DerivedData
+          key: dd-check-${{ runner.os }}-${{ hashFiles('app/**', 'scripts/gen-xcode-project.rb', 'ish-arm64/**') }}
+          restore-keys: |
+            dd-check-${{ runner.os }}-
+            dd-${{ runner.os }}-
+
+      - name: Compile
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee build/compile.log
+
+      # Warnings in the files this branch touched are worth surfacing even when
+      # the build succeeds: DSHRootViewController.m is new code, not legacy.
+      - name: Show diagnostics for changed sources
+        if: always()
+        shell: bash
+        run: |
+          if grep -E '(error|warning):' build/compile.log | grep -E 'DSHRootViewController|dsh-ios' ; then
+            echo "::warning::diagnostics in files this branch changed (see above)"
+          else
+            echo "no diagnostics in DSHRootViewController.m"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compile-log
+          path: build/compile.log
+          if-no-files-found: warn
+          retention-days: 7
