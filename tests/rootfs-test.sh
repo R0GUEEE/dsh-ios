@@ -86,6 +86,37 @@ grep -A4 '^- id: sandbox-policy' "$WORK/config.yml" > "$WORK/sandbox-row.yml"
 check "sandbox-policy patched to danger-full-access" grep -q 'danger-full-access' "$WORK/sandbox-row.yml"
 check "hmr row present (needs --expose-internals)"    grep -q 'cordis-plugin-hmr' "$WORK/config.yml"
 
+echo "== plugin platform: skills, MCP, and the runtime layer compose"
+# These rows are what makes skills and MCP servers work at all; a patch-layer
+# edit that dropped or misnamed one would otherwise only show on a device.
+check "ios-platform row composed"  grep -q 'id: ios-platform' "$WORK/config.yml"
+check "ios-mcp row composed"       grep -q 'id: ios-mcp' "$WORK/config.yml"
+check "host-bridge row composed"   grep -q 'id: host-bridge' "$WORK/config.yml"
+check "skill-filesystem owns a config" grep -A9 'id: skill-filesystem' "$WORK/config.yml" | grep -q 'bundledSkillDir'
+check "bundled skill dir is the image's" grep -A12 'id: skill-filesystem' "$WORK/config.yml" | grep -q '/usr/local/share/dsh/skills'
+check "skill watching uses polling" grep -A12 'id: skill-filesystem' "$WORK/config.yml" | grep -q 'watchUsePolling: true'
+
+# The image manifest is read by the in-guest guard; if it is missing the guard
+# refuses every bridge tool, which looks like "the agent cannot use the phone".
+guest 'cat /usr/local/share/dsh/image.json' > "$WORK/image.json"
+check "image manifest ships with the guest" test -s "$WORK/image.json"
+check "manifest names the pinned dsh"      grep -q '"dshVersion"' "$WORK/image.json"
+check "manifest lists the host bridge"     grep -q 'dsh-host-bridge' "$WORK/image.json"
+check "mcp example ships with the guest"   test -f "$WORK/fakefs/data/usr/local/share/dsh/mcp.example.json"
+check "bundled skill ships with the guest" test -f "$WORK/fakefs/data/usr/local/share/dsh/skills/dsh-ios-platform/SKILL.md"
+
+# The shipped skill must clear the provider's own frontmatter rules (lowercase
+# kebab name, description present) or discovery silently ignores it.
+guest 'head -4 /usr/local/share/dsh/skills/dsh-ios-platform/SKILL.md' > "$WORK/skill-head.txt"
+check "bundled skill has a name"        grep -q '^name: dsh-ios-platform$' "$WORK/skill-head.txt"
+check "bundled skill has a description" grep -q '^description: ' "$WORK/skill-head.txt"
+
+# The MCP example must parse and mount nothing: a malformed default file would
+# mean every fresh install starts with a broken plugin.
+guest 'node -e "const c=require(\"/usr/local/share/dsh/mcp.example.json\"); if(!c.servers||Object.keys(c.servers).length) process.exit(1); console.log(\"MCP-EXAMPLE-OK\")"' > "$WORK/mcp-example.txt"
+check "mcp example parses and ships no servers" grep -q 'MCP-EXAMPLE-OK' "$WORK/mcp-example.txt"
+
+
 echo "== headless LLM round trip through mock DeepSeek server (SSE via fetch polyfill)"
 node "$HERE/mock-deepseek.mjs" "$MOCK_PORT" > "$WORK/mock.log" 2>&1 &
 MOCK_PID=$!
