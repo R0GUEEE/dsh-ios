@@ -96,7 +96,7 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         UC_SP(exit_sp);
 
         // Redirect execution to crash trampoline (returns INT_JIT_CRASH)
-        UC_PC(jit_crash_trampoline);
+        UC_PC((uint64_t) jit_crash_trampoline);
 
         // Unblock signal so it can fire again on next crash
         sigset_t unblock;
