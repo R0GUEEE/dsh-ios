@@ -105,8 +105,11 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if grep -E '(error|warning):' build/compile.log | grep -E 'DSHRootViewController|dsh-ios' ; then
-            echo "::warning::diagnostics in files this branch changed (see above)"
+          # Match the file, not the checkout path: the runner's working
+          # directory contains "dsh-ios", so a loose pattern reports every
+          # warning in the vendored emulator as if it were this branch's.
+          if grep -E '^/?.*app/DSHRootViewController\.m:[0-9]+:[0-9]+: (error|warning):' build/compile.log ; then
+            echo "::warning::diagnostics in DSHRootViewController.m (see above)"
           else
             echo "no diagnostics in DSHRootViewController.m"
           fi
